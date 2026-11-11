@@ -309,38 +309,78 @@ function waitForExit(child, timeoutMs) {
 }
 
 /**
- * Terminate the child and every process in its group/tree.
+ * Probe whether any process in the group still exists (zombies included).
+ * @param {number} pid - process-group leader pid (POSIX only).
+ * @returns {boolean} True while `kill(-pid, 0)` does not report ESRCH.
+ */
+function isGroupAlive(pid) {
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    return error.code !== 'ESRCH'
+  }
+}
+
+/**
+ * @param {number} pid
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>} True once the process group no longer exists.
+ */
+async function waitForGroupGone(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (isGroupAlive(pid)) {
+    if (Date.now() >= deadline) return false
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  return true
+}
+
+/**
+ * Terminate the child and every process in its group/tree. The direct child
+ * exiting is not enough: a descendant may ignore SIGTERM, so escalate to
+ * SIGKILL on the whole group until the group itself is gone.
  * @param {import('node:child_process').ChildProcess} child
+ * @returns {Promise<boolean>} True when no process from the group remains.
  */
 async function terminate(child) {
-  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return
+  const pid = child.pid
+  if (pid === undefined) return true
   if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  } else {
-    try {
-      process.kill(-child.pid, 'SIGTERM')
-    } catch (error) {
-      if (error.code !== 'ESRCH') {
-        try {
-          child.kill('SIGTERM')
-        } catch {
-          // The child is already gone.
-        }
+    // taskkill /T /F walks the tree; there is no POSIX-style group probe.
+    spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' })
+    return waitForExit(child, SHUTDOWN_GRACE_MS)
+  }
+  if (!isGroupAlive(pid)) return true
+  try {
+    process.kill(-pid, 'SIGTERM')
+  } catch (error) {
+    if (error.code !== 'ESRCH') {
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        // The child is already gone.
       }
     }
   }
-  if (await waitForExit(child, SHUTDOWN_GRACE_MS)) return
-  logError(`runtime did not exit within ${String(SHUTDOWN_GRACE_MS)}ms; sending SIGKILL`)
-  if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  } else {
-    try {
-      process.kill(-child.pid, 'SIGKILL')
-    } catch {
-      // The group is already gone.
+  const leaderExited = await waitForExit(child, SHUTDOWN_GRACE_MS)
+  if (leaderExited && !isGroupAlive(pid)) return true
+  logError(`process group ${String(pid)} survived SIGTERM; sending SIGKILL`)
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch (error) {
+    if (error.code !== 'ESRCH') {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // The child is already gone.
+      }
     }
   }
   await waitForExit(child, 2_000)
+  if (await waitForGroupGone(pid, 2_000)) return true
+  logError(`process group ${String(pid)} still exists after SIGKILL`)
+  return false
 }
 
 /**
@@ -397,7 +437,7 @@ export async function main(argv) {
     const zipPath = resolve(options.zip)
     if (!existsSync(zipPath)) {
       logError(`zip not found: ${zipPath}`)
-      return EXIT_FAILURE
+      return EXIT_USAGE
     }
     extractionDir = mkdtempSync(join(tmpdir(), 'logexus-core-extract-'))
     try {
@@ -417,7 +457,7 @@ export async function main(argv) {
   if (!existsSync(cliEntry)) {
     logError(`runtime entry not found: ${cliEntry}`)
     if (extractionDir !== undefined) rmSync(extractionDir, { recursive: true, force: true })
-    return EXIT_USAGE
+    return EXIT_FAILURE
   }
 
   const logDir = mkdtempSync(join(tmpdir(), 'logexus-contract-'))
@@ -468,9 +508,13 @@ export async function main(argv) {
       process.off('SIGTERM', signalHandlers)
     }
     if (runtime !== undefined) {
-      await terminate(runtime.child)
+      const groupGone = await terminate(runtime.child)
       const released = await waitForPortRelease(CONTRACT_PORT, PORT_RELEASE_TIMEOUT_MS)
       runtime.closeFiles()
+      if (!groupGone) {
+        logError(`process group ${String(runtime.child.pid)} still has members after cleanup`)
+        exitCode = EXIT_FAILURE
+      }
       if (!released) {
         logError(`port ${String(CONTRACT_PORT)} is still listening after shutdown; the runtime leaked a child`)
         exitCode = EXIT_FAILURE

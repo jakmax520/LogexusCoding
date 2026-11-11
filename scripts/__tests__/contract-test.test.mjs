@@ -37,10 +37,12 @@ const TOKEN = 'AbCdEfGhIjKlMnOp';
 const STUB_CLI = [
   "import { createServer } from 'node:http'",
   "import { spawn } from 'node:child_process'",
-  "import { writeFileSync } from 'node:fs'",
+  "import { existsSync, writeFileSync } from 'node:fs'",
   `const token = '${TOKEN}'`,
   "const session = 'dsh_session=stub'",
-  "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })",
+  "const stubborn = process.env.CONTRACT_STUB_STUBBORN === '1'",
+  'const childCode = stubborn ? "process.on(\'SIGTERM\', () => {}); require(\'node:fs\').writeFileSync(\'grandchild.ready\', \'1\'); setInterval(() => {}, 1000)" : "require(\'node:fs\').writeFileSync(\'grandchild.ready\', \'1\'); setInterval(() => {}, 1000)"',
+  "const grandchild = spawn(process.execPath, ['-e', childCode], { stdio: 'ignore' })",
   "writeFileSync('grandchild.pid', String(grandchild.pid))",
   "const server = createServer((req, res) => {",
   "  const url = new URL(req.url ?? '/', 'http://127.0.0.1')",
@@ -53,9 +55,13 @@ const STUB_CLI = [
   "  if (authed) { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); return }",
   "  res.writeHead(401, { 'content-type': 'text/plain' }); res.end('unauthorized')",
   '})',
-  "server.listen(3080, '127.0.0.1', () => {",
-  "  console.log('dsh web: http://127.0.0.1:3080/?token=' + token)",
-  '})',
+  "const start = () => {",
+  "  if (!existsSync('grandchild.ready')) { setTimeout(start, 10); return }",
+  "  server.listen(3080, '127.0.0.1', () => {",
+  "    console.log('dsh web: http://127.0.0.1:3080/?token=' + token)",
+  "  })",
+  '}',
+  'start()',
 ].join('\n');
 
 function fakeRuntime(root) {
@@ -121,6 +127,52 @@ test('boots, authenticates, and cleans up the whole process tree', async (t) => 
     else process.env.TMPDIR = previousTmp;
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+test('escalates to SIGKILL when a grandchild ignores SIGTERM', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const scratch = mkdtempSync(join(tmpdir(), 'contract-selftest-'));
+  const previousTmp = process.env.TMPDIR;
+  process.env.TMPDIR = scratch;
+  process.env.CONTRACT_STUB_STUBBORN = '1';
+  try {
+    const runtimeDir = fakeRuntime(scratch);
+    const exitCode = await main([`--dir=${runtimeDir}`, '--timeout=30']);
+    assert.equal(exitCode, 0);
+    assert.equal(await portFree(3080), true);
+
+    const grandchildPid = Number(readFileSync(join(runtimeDir, 'grandchild.pid'), 'utf8'));
+    assert.equal(
+      await waitUntilDead(grandchildPid),
+      true,
+      'a SIGTERM-ignoring grandchild must be SIGKILLed with its process group',
+    );
+  } finally {
+    delete process.env.CONTRACT_STUB_STUBBORN;
+    if (previousTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmp;
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('exits 3 when the extracted runtime has no CLI entry', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const scratch = mkdtempSync(join(tmpdir(), 'contract-selftest-'));
+  try {
+    const emptyRuntime = join(scratch, 'empty-runtime');
+    mkdirSync(emptyRuntime, { recursive: true });
+    assert.equal(await main([`--dir=${emptyRuntime}`, '--timeout=5']), 3);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('exits 1 when the zip path does not exist', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  assert.equal(await main(['--zip=/nonexistent/contract-test.zip']), 1);
 });
 
 test('exits 3 when port 3080 is already occupied', async (t) => {
