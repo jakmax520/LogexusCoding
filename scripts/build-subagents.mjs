@@ -16,7 +16,8 @@
  * Usage: node scripts/build-subagents.mjs --platform=<platform> [--out=<path>]
  */
 import {
-  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync,
+  statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -24,15 +25,13 @@ import { fileURLToPath } from 'node:url';
 
 import { createZip, listZipEntries } from './lib/archive.mjs';
 import { hostPlatform, platformMismatchMessage, SUPPORTED_PLATFORMS } from './lib/platform.mjs';
+import {
+  missingNativePackages, nativePackageName, REQUIRED_SUBAGENT_ROOTS,
+} from './lib/subagent-bundle.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SOURCE_DIR = join(REPO_ROOT, 'coding-harness');
-const REQUIRED_ROOTS = ['@anthropic-ai/claude-agent-sdk', '@openai/codex'];
-// The upstream provider packages declare the vendor SDK dependencies.
-const PROVIDER_PACKAGES = [
-  { name: 'subagent-claude-code', roots: ['@anthropic-ai/claude-agent-sdk'] },
-  { name: 'subagent-codex', roots: ['@openai/codex'] },
-];
+const SUBAGENT_PACKAGE_ROOT = join(SOURCE_DIR, 'packages/subagent');
 
 class BundleError extends Error {}
 
@@ -102,6 +101,36 @@ function readPackageManifest(directory) {
 }
 
 /**
+ * Find the workspace provider package that declares each required vendor SDK.
+ * Keeping this mapping derived from `package.json` avoids a second hardcoded
+ * package list that could drift from lib/package-rules.mjs.
+ * @param {ReadonlyArray<string>} roots
+ * @returns {Map<string, string>} root package name -> provider directory
+ */
+function findProviders(roots) {
+  if (!existsSync(SUBAGENT_PACKAGE_ROOT)) {
+    fail(`subagent provider packages not found: ${SUBAGENT_PACKAGE_ROOT}`);
+  }
+  const providers = new Map();
+  for (const entry of readdirSync(SUBAGENT_PACKAGE_ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const directory = join(SUBAGENT_PACKAGE_ROOT, entry.name);
+    if (!existsSync(join(directory, 'package.json'))) continue;
+    const manifest = readPackageManifest(directory);
+    for (const root of roots) {
+      if (manifest.dependencies?.[root] === undefined) continue;
+      if (providers.has(root)) {
+        fail(`multiple provider packages declare ${root}: ${providers.get(root)} and ${directory}`);
+      }
+      providers.set(root, directory);
+    }
+  }
+  const missing = roots.filter((root) => !providers.has(root));
+  if (missing.length > 0) fail(`no subagent provider package declares: ${missing.join(', ')}`);
+  return providers;
+}
+
+/**
  * Walk declared runtime dependencies from the provider roots.
  *
  * Node module resolution is used, and optional dependencies are included only
@@ -115,21 +144,15 @@ function readPackageManifest(directory) {
 function collectClosure() {
   const packages = new Map();
   const queue = [];
-  for (const provider of PROVIDER_PACKAGES) {
-    const providerDir = join(SOURCE_DIR, 'packages/subagent', provider.name);
-    if (!existsSync(join(providerDir, 'package.json'))) {
-      fail(`subagent provider not found: ${providerDir}`);
+  for (const [root, providerDir] of findProviders(REQUIRED_SUBAGENT_ROOTS)) {
+    const dir = resolvePackageDir(providerDir, root);
+    if (dir === undefined) {
+      fail(
+        `missing subagent dependency ${root}; run "corepack pnpm install --frozen-lockfile" `
+        + 'in coding-harness/ (or run build-core.mjs first) and retry',
+      );
     }
-    for (const root of provider.roots) {
-      const dir = resolvePackageDir(providerDir, root);
-      if (dir === undefined) {
-        fail(
-          `missing subagent dependency ${root}; run "corepack pnpm install --frozen-lockfile" `
-          + 'in coding-harness/ (or run build-core.mjs first) and retry',
-        );
-      }
-      queue.push({ key: root, dir });
-    }
+    queue.push({ key: root, dir });
   }
 
   while (queue.length > 0) {
@@ -198,18 +221,33 @@ function main() {
   log(`platform=${options.platform} out=${options.out}`);
   log('step 1/4: resolve optional subagent packages');
   const packages = collectClosure();
-  for (const root of REQUIRED_ROOTS) {
+  for (const root of REQUIRED_SUBAGENT_ROOTS) {
     if (!packages.has(root)) fail(`required package missing from bundle closure: ${root}`);
   }
+  // The wrapper SDKs are useless without their host-native binary package.
+  const missingNative = missingNativePackages(
+    packages.keys(), REQUIRED_SUBAGENT_ROOTS, options.platform,
+  );
+  if (missingNative.length > 0) {
+    fail(
+      `bundle for ${options.platform} is missing host-native package(s): `
+      + `${missingNative.join(', ')}. Run "corepack pnpm install --frozen-lockfile" `
+      + 'on this platform and retry.',
+    );
+  }
+  const nativeNames = REQUIRED_SUBAGENT_ROOTS
+    .map((root) => nativePackageName(root, options.platform))
+    .filter((name) => name !== undefined);
+  log(`native packages: ${nativeNames.join(', ')}`);
   log(`resolved ${packages.size} package(s): ${[...packages.keys()].sort().join(', ')}`);
 
   const staging = mkdtempSync(join(tmpdir(), 'logexus-subagents-'));
   try {
     log('step 2/4: stage hoisted node_modules tree');
     stageBundle(packages, staging);
-    for (const root of REQUIRED_ROOTS) {
-      if (!existsSync(join(staging, 'node_modules', root, 'package.json'))) {
-        fail(`staged bundle is missing ${root}/package.json`);
+    for (const name of [...REQUIRED_SUBAGENT_ROOTS, ...nativeNames]) {
+      if (!existsSync(join(staging, 'node_modules', name, 'package.json'))) {
+        fail(`staged bundle is missing ${name}/package.json`);
       }
     }
 
@@ -220,8 +258,8 @@ function main() {
 
     log('step 4/4: verify zip contents');
     const entries = new Set(listZipEntries(options.out));
-    for (const root of REQUIRED_ROOTS) {
-      const expected = `node_modules/${root}/package.json`;
+    for (const name of [...REQUIRED_SUBAGENT_ROOTS, ...nativeNames]) {
+      const expected = `node_modules/${name}/package.json`;
       if (!entries.has(expected)) fail(`zip does not contain ${expected}`);
     }
 
