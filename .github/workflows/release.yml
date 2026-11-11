@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            platform: macos-x64
+          - os: macos-14
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-latest
+            platform: linux-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Build core runtime
+        run: node scripts/build-core.mjs --platform=${{ matrix.platform }}
+
+      - name: Boot contract test
+        run: node scripts/contract-test.mjs --zip=dist/core-${{ matrix.platform }}.zip
+
+      - name: Build subagent overlay
+        run: node scripts/build-subagents.mjs --platform=${{ matrix.platform }}
+
+      # A failed platform must not publish packages that never booted. The
+      # release job needs every matrix job, so nothing is published at all.
+      - name: Record failed platform
+        if: failure()
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "::error::${PLATFORM} failed the build or boot contract test; its packages will not be published."
+          {
+            echo "### ${PLATFORM} not published"
+            echo ""
+            echo "The build or boot contract test failed, so this platform's artifacts were not uploaded."
+            echo "The release job does not run until every platform passes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload platform packages
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-coding-${{ matrix.platform }}
+          path: |
+            dist/core-${{ matrix.platform }}.zip
+            dist/subagents-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download all platform packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: ai-coding-*
+          merge-multiple: true
+
+      - name: Generate manifest
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          node scripts/make-manifest.mjs \
+            --version="${VERSION#v}" \
+            --artifacts=release \
+            --base-url="https://github.com/${REPOSITORY}/releases/download/${VERSION}" \
+            --out=release/manifest.json
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" \
+              release/manifest.json release/core-*.zip release/subagents-*.zip --clobber
+          else
+            gh release create "$VERSION" \
+              release/manifest.json release/core-*.zip release/subagents-*.zip \
+              --title "$VERSION" --generate-notes
+          fi

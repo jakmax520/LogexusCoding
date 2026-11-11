@@ -5,3 +5,4 @@ apps/web/dist/
 *.tsbuildinfo
 dist/
 build.log
+.DS_Store

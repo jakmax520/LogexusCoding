@@ -18,4 +18,5 @@ Logexus 的 AI Coding 引擎独立仓库。基座为 DeepSeek 开源的
 ## 开发
 
 引擎自身的构建与开发说明见 `coding-harness/` 内的上游文档。
-本仓库的构建脚本与 CI 将在后续任务中补充。
+`coding-harness/.github/` 是上游自带的 CI 配置，仅在上游仓库中运行，不会从本仓库根目录执行。
+本仓库自身的四平台构建与发布 CI 位于 `.github/workflows/release.yml`。

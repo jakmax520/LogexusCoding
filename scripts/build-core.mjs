@@ -14,10 +14,12 @@ import {
   readlinkSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { createZip } from './lib/archive.mjs'
 import { isOptionalSubagent, shouldExclude } from './lib/package-rules.mjs'
+import { hostPlatform, platformMismatchMessage } from './lib/platform.mjs'
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const SOURCE_DIR = join(REPO_ROOT, 'coding-harness')
@@ -58,8 +60,24 @@ function parseArgs(argv) {
   if (!SUPPORTED_PLATFORMS.has(options.platform)) {
     fail(`unsupported platform: ${options.platform} (supported: ${[...SUPPORTED_PLATFORMS].join(', ')})`)
   }
+  // The dependency install and native binaries follow the build host; a
+  // mismatched label would ship a package that cannot run on the target.
+  const host = hostPlatform()
+  if (host !== options.platform) fail(platformMismatchMessage(options.platform, host))
   options.out = resolve(process.cwd(), options.out ?? join('dist', `core-${options.platform}.zip`))
   return options
+}
+
+/**
+ * corepack is a `.cmd` shim on Windows, which execFile cannot launch directly;
+ * the shell resolves it there. POSIX keeps direct execution so arguments with
+ * shell-special characters are not reinterpreted.
+ */
+function corepack(args, options) {
+  return execFileSync('corepack', args, {
+    shell: process.platform === 'win32',
+    ...options,
+  })
 }
 
 function checkPrerequisites() {
@@ -70,7 +88,7 @@ function checkPrerequisites() {
     missing.push('node')
   }
   try {
-    execFileSync('corepack', ['pnpm', '--version'], { stdio: 'ignore' })
+    corepack(['pnpm', '--version'], { stdio: 'ignore' })
   } catch {
     missing.push('pnpm (via corepack)')
   }
@@ -81,7 +99,7 @@ function checkPrerequisites() {
 
 function pnpm(args, cwd, env = {}) {
   log(`pnpm ${args.join(' ')} (cwd=${cwd})`)
-  execFileSync('corepack', ['pnpm', ...args], {
+  corepack(['pnpm', ...args], {
     cwd,
     stdio: 'inherit',
     env: { ...process.env, ...env },
@@ -130,7 +148,7 @@ function shouldPrune(name) {
 }
 
 function workspaceProjects(workTree) {
-  const output = execFileSync('corepack', ['pnpm', '-r', 'list', '--depth', '-1', '--json'], {
+  const output = corepack(['pnpm', '-r', 'list', '--depth', '-1', '--json'], {
     cwd: workTree,
     encoding: 'utf8',
     env: { ...process.env, CI: 'true' },
@@ -146,7 +164,10 @@ function workspaceLinkTarget(linkPath, workTreeRealPath) {
   } catch {
     return undefined
   }
-  return target.startsWith(`${workTreeRealPath}/`) ? target : undefined
+  // Use the platform separator: Windows realpaths use `\`, so a hardcoded `/`
+  // would reject every workspace link there.
+  const prefix = workTreeRealPath.endsWith(sep) ? workTreeRealPath : `${workTreeRealPath}${sep}`
+  return target.startsWith(prefix) ? target : undefined
 }
 
 /** Record workspace-package links found directly under one `node_modules`. */
@@ -447,10 +468,9 @@ function main() {
     mkdirSync(dirname(options.out), { recursive: true })
     rmSync(options.out, { force: true })
     try {
-      execFileSync('zip', ['-q', '-r', options.out, '.'], { cwd: runtime, stdio: 'inherit' })
+      createZip(runtime, options.out)
     } catch (error) {
-      if (error?.code === 'ENOENT') fail('zip not found on PATH; install the zip utility and retry')
-      throw error
+      fail(error instanceof Error ? error.message : String(error))
     }
 
     log(`done: ${options.out} (${filesize(statSync(options.out).size)})`)
