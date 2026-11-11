@@ -1,0 +1,27 @@
+{
+  "name": "@deepseek-ai/dsh-logexus-config",
+  "description": "Logexus 专属运行时配置接口（/api/logexus/config），运行时注入 DeepSeek 凭据与地址",
+  "version": "0.1.2-alpha.1",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.js",
+    "lib/types/**/*.d.ts"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:^",
+    "@deepseek-ai/dsh-host-webserver": "workspace:^",
+    "@deepseek-ai/dsh-llm-deepseek": "workspace:^"
+  }
+}

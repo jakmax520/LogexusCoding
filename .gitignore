@@ -1,0 +1,7 @@
+node_modules/
+packages/*/lib/
+apps/*/lib/
+apps/web/dist/
+*.tsbuildinfo
+dist/
+build.log
