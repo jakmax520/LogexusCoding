@@ -14,7 +14,7 @@ import {
   readlinkSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { isOptionalSubagent, shouldExclude } from './lib/package-rules.mjs'
@@ -179,10 +179,26 @@ function scanWorkspaceLinks(nodeModules, workTree, found) {
  */
 function hoistWorkspacePackages(workTree, nodeModules) {
   const found = new Map()
+  const projects = workspaceProjects(workTree)
   // Compare against the real path: pnpm resolves the temporary work tree to
   // /private/var/... on macOS while mkdtemp returns /var/....
   const workTreeRealPath = realpathSync(workTree)
-  for (const project of workspaceProjects(workTree)) {
+
+  // A production install only links workspace packages that are regular
+  // dependencies of some project. The harness also loads packages that are
+  // referenced only as peer/devDependencies, so materialize every
+  // @deepseek-ai/* workspace package up front.
+  for (const project of projects) {
+    if (resolve(project.path) === resolve(workTree)) continue
+    const manifestPath = join(project.path, 'package.json')
+    if (!existsSync(manifestPath)) continue
+    const name = JSON.parse(readFileSync(manifestPath, 'utf8')).name
+    if (typeof name === 'string' && name.startsWith('@deepseek-ai/')) found.set(name, project.path)
+  }
+
+  // Keep any remaining linked workspace packages (for example non-@deepseek-ai
+  // workspace names) that the dependency graph linked into a project tree.
+  for (const project of projects) {
     scanWorkspaceLinks(join(project.path, 'node_modules'), workTreeRealPath, found)
   }
   scanWorkspaceLinks(nodeModules, workTreeRealPath, found)
@@ -235,6 +251,68 @@ function pruneExcluded(nodeModules) {
   log(removed.length > 0 ? `pruned: ${removed.join(', ')}` : 'pruned: nothing to remove')
 }
 
+/** Every built `packages/<group>/<name>/lib` directory under one packages root. */
+function packageLibDirs(packagesRoot) {
+  const dirs = []
+  for (const group of readdirSync(packagesRoot)) {
+    const groupDir = join(packagesRoot, group)
+    if (!statSync(groupDir).isDirectory()) continue
+    for (const name of readdirSync(groupDir)) {
+      const libDir = join(groupDir, name, 'lib')
+      if (existsSync(libDir) && statSync(libDir).isDirectory()) dirs.push(libDir)
+    }
+  }
+  return dirs
+}
+
+/** Import forms that can pull a package into the running process. */
+const WORKSPACE_IMPORT_PATTERNS = [
+  /\bfrom\s*['"](@deepseek-ai\/[^'"]+)['"]/g,
+  /\bimport\s*\(\s*['"](@deepseek-ai\/[^'"]+)['"]\s*\)/g,
+  /\brequire\s*\(\s*['"](@deepseek-ai\/[^'"]+)['"]\s*\)/g,
+  /\bimport\s+['"](@deepseek-ai\/[^'"]+)['"]/g,
+]
+
+function jsFilesUnder(root) {
+  const files = []
+  for (const entry of readdirSync(root)) {
+    const path = join(root, entry)
+    const stats = lstatSync(path)
+    if (stats.isDirectory()) files.push(...jsFilesUnder(path))
+    else if (stats.isFile() && entry.endsWith('.js')) files.push(path)
+  }
+  return files
+}
+
+/**
+ * Assert that every `@deepseek-ai/*` package imported by runtime code exists
+ * in the packaged node_modules. Peer-only and lazily loaded packages are easy
+ * to miss; fail the build instead of shipping an unbootable tree.
+ */
+function assertWorkspaceImportsResolve(runtime) {
+  const nodeModules = join(runtime, 'node_modules')
+  const roots = [join(runtime, 'apps/cli/lib'), ...packageLibDirs(join(runtime, 'packages'))]
+  const referenced = new Set()
+  const unresolved = new Set()
+  for (const root of roots) {
+    for (const file of jsFilesUnder(root)) {
+      const source = readFileSync(file, 'utf8')
+      for (const pattern of WORKSPACE_IMPORT_PATTERNS) {
+        for (const match of source.matchAll(pattern)) {
+          const [scope, name] = match[1].split('/')
+          const packageName = `${scope}/${name}`
+          referenced.add(packageName)
+          if (!existsSync(join(nodeModules, packageName, 'package.json'))) unresolved.add(packageName)
+        }
+      }
+    }
+  }
+  if (unresolved.size > 0) {
+    fail(`unresolved @deepseek-ai imports in runtime tree: ${[...unresolved].sort().join(', ')}`)
+  }
+  log(`static import scan: ${referenced.size} workspace package(s) referenced, all resolved`)
+}
+
 function assembleRuntime(workTree, runtime) {
   mkdirSync(runtime, { recursive: true })
 
@@ -243,14 +321,8 @@ function assembleRuntime(workTree, runtime) {
   copyTree(join(workTree, 'apps/web/dist'), join(runtime, 'apps/web/dist'))
 
   const packagesRoot = join(workTree, 'packages')
-  for (const group of readdirSync(packagesRoot)) {
-    const groupDir = join(packagesRoot, group)
-    if (!statSync(groupDir).isDirectory()) continue
-    for (const name of readdirSync(groupDir)) {
-      const libDir = join(groupDir, name, 'lib')
-      if (!existsSync(libDir) || !statSync(libDir).isDirectory()) continue
-      copyTree(libDir, join(runtime, 'packages', group, name, 'lib'))
-    }
+  for (const libDir of packageLibDirs(packagesRoot)) {
+    copyTree(libDir, join(runtime, 'packages', relative(packagesRoot, libDir)))
   }
 
   copyTree(join(workTree, 'node_modules'), join(runtime, 'node_modules'))
@@ -350,6 +422,7 @@ function main() {
     log('step 7/8: assemble runtime tree')
     assembleRuntime(workTree, runtime)
     verifySelfContained(runtime)
+    assertWorkspaceImportsResolve(runtime)
 
     log('step 8/8: zip runtime')
     mkdirSync(dirname(options.out), { recursive: true })
