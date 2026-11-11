@@ -189,7 +189,7 @@ function hoistWorkspacePackages(workTree, nodeModules) {
   // referenced only as peer/devDependencies, so materialize every
   // @deepseek-ai/* workspace package up front.
   for (const project of projects) {
-    if (resolve(project.path) === resolve(workTree)) continue
+    if (realpathSync(project.path) === workTreeRealPath) continue
     const manifestPath = join(project.path, 'package.json')
     if (!existsSync(manifestPath)) continue
     const name = JSON.parse(readFileSync(manifestPath, 'utf8')).name
@@ -270,18 +270,33 @@ const WORKSPACE_IMPORT_PATTERNS = [
   /\bfrom\s*['"](@deepseek-ai\/[^'"]+)['"]/g,
   /\bimport\s*\(\s*['"](@deepseek-ai\/[^'"]+)['"]\s*\)/g,
   /\brequire\s*\(\s*['"](@deepseek-ai\/[^'"]+)['"]\s*\)/g,
+  /\brequire\.resolve\s*\(\s*['"](@deepseek-ai\/[^'"]+)['"]\s*\)/g,
   /\bimport\s+['"](@deepseek-ai\/[^'"]+)['"]/g,
 ]
 
-function jsFilesUnder(root) {
+const MODULE_FILE_PATTERN = /\.(?:c|m)?js$/u
+
+function moduleFilesUnder(root) {
   const files = []
   for (const entry of readdirSync(root)) {
     const path = join(root, entry)
     const stats = lstatSync(path)
-    if (stats.isDirectory()) files.push(...jsFilesUnder(path))
-    else if (stats.isFile() && entry.endsWith('.js')) files.push(path)
+    if (stats.isDirectory()) files.push(...moduleFilesUnder(path))
+    else if (stats.isFile() && MODULE_FILE_PATTERN.test(entry)) files.push(path)
   }
   return files
+}
+
+/** Every materialized `node_modules/@deepseek-ai/<name>/lib` directory. */
+function scopedPackageLibDirs(nodeModules) {
+  const scopeDir = join(nodeModules, '@deepseek-ai')
+  if (!existsSync(scopeDir)) return []
+  const dirs = []
+  for (const name of readdirSync(scopeDir)) {
+    const libDir = join(scopeDir, name, 'lib')
+    if (existsSync(libDir) && statSync(libDir).isDirectory()) dirs.push(libDir)
+  }
+  return dirs
 }
 
 /**
@@ -291,11 +306,15 @@ function jsFilesUnder(root) {
  */
 function assertWorkspaceImportsResolve(runtime) {
   const nodeModules = join(runtime, 'node_modules')
-  const roots = [join(runtime, 'apps/cli/lib'), ...packageLibDirs(join(runtime, 'packages'))]
+  const roots = [
+    join(runtime, 'apps/cli/lib'),
+    ...packageLibDirs(join(runtime, 'packages')),
+    ...scopedPackageLibDirs(nodeModules),
+  ]
   const referenced = new Set()
   const unresolved = new Set()
   for (const root of roots) {
-    for (const file of jsFilesUnder(root)) {
+    for (const file of moduleFilesUnder(root)) {
       const source = readFileSync(file, 'utf8')
       for (const pattern of WORKSPACE_IMPORT_PATTERNS) {
         for (const match of source.matchAll(pattern)) {
