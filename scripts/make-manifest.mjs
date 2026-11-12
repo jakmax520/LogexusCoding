@@ -10,7 +10,7 @@
  *
  * The single-platform form defaults `--core` to `dist/core-<platform>.zip` and
  * includes `dist/subagents-<platform>.zip` when it exists. The `--artifacts`
- * form is used by the release job and requires all four platform core packages.
+ * form is used by the release job and requires every supported platform core package.
  */
 import { createHash } from 'node:crypto';
 import {
@@ -20,7 +20,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 import { buildManifest, validateManifest } from './lib/manifest.mjs';
 
-const SUPPORTED_PLATFORMS = ['macos-x64', 'macos-arm64', 'windows-x64', 'linux-x64'];
+const SUPPORTED_PLATFORMS = ['macos-x64', 'windows-x64', 'linux-x64'];
 const DEFAULT_REPO = 'jakmax520/LogexusCoding';
 const HASH_CHUNK_SIZE = 1024 * 1024;
 
